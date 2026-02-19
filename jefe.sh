@@ -113,6 +113,12 @@ truncate_path() {
   printf '...%s\n' "${text:len-max+3}"
 }
 
+strip_ansi() {
+  local text="$1"
+  # Labels only use SGR color sequences, so removing CSI ... m is enough here.
+  printf '%s' "$text" | sed -E $'s/\x1B\\[[0-9;?]*m//g' 2>/dev/null || printf '%s' "$text"
+}
+
 normalize_path() {
   local p="$1"
   if command -v realpath >/dev/null 2>&1; then
@@ -208,19 +214,27 @@ select_menu() {
   local title="$1"
   shift
   local -a items=("$@")
-  local count="${#items[@]}"
+  local total_count="${#items[@]}"
+  local count=0
   local idx=0
   local offset=0
   local rows=24
   local cols=80
   local visible=12
-  local menu_top=3
+  local menu_top=4
   local i line text key rest title_view
   local prev_idx=-1
   local prev_offset=-1
   local old_line new_line
+  local query=""
+  local query_lc
+  local search_mode=0
+  local filter_dirty=1
+  local filter_view
+  local -a filtered_indices=()
+  local printable
 
-  if (( count == 0 )); then
+  if (( total_count == 0 )); then
     return 1
   fi
 
@@ -234,7 +248,7 @@ select_menu() {
     cols="$(tput cols 2>/dev/null || echo 80)"
   fi
   TERM_COLS="$cols"
-  visible=$((rows - 7))
+  visible=$((rows - 8))
   if (( visible < 6 )); then
     visible=6
   fi
@@ -248,6 +262,43 @@ select_menu() {
   tput clear 2>/dev/null || printf '\033[H\033[2J'
 
   while true; do
+    if (( filter_dirty )); then
+      filtered_indices=()
+      if [[ -z "$query" ]]; then
+        for ((i = 0; i < total_count; i++)); do
+          filtered_indices+=("$i")
+        done
+      else
+        query_lc="${query,,}"
+        for ((i = 0; i < total_count; i++)); do
+          text="$(strip_ansi "${items[$i]}")"
+          if [[ "${text,,}" == *"$query_lc"* ]]; then
+            filtered_indices+=("$i")
+          fi
+        done
+      fi
+
+      count="${#filtered_indices[@]}"
+      if (( count == 0 )); then
+        idx=0
+        offset=0
+      else
+        if (( idx >= count )); then
+          idx=$((count - 1))
+        fi
+        if (( idx < 0 )); then
+          idx=0
+        fi
+      fi
+
+      prev_idx=-1
+      prev_offset=-1
+      filter_dirty=0
+    fi
+
+    if (( count == 0 )); then
+      offset=0
+    fi
     if (( idx < offset )); then
       offset=$idx
     fi
@@ -260,9 +311,18 @@ select_menu() {
       tput el 2>/dev/null || true
       printf '%s\n' "$title_view"
       tput el 2>/dev/null || true
-      printf '%sUsa frecce su/giu, Invio per confermare, q per uscire.%s\n' "$CLR_DIM" "$CLR_RESET"
+      printf '%sUsa frecce su/giu o j/k, / filtra, Invio conferma, q esce.%s\n' "$CLR_DIM" "$CLR_RESET"
       tput el 2>/dev/null || true
-      printf '%sElementi: %d  Pagina: %d-%d%s\n' "$CLR_DIM" "$count" "$((offset + 1))" "$(( offset + visible < count ? offset + visible : count ))" "$CLR_RESET"
+      printf '%sElementi: %d/%d  Pagina: %d-%d%s\n' "$CLR_DIM" "$count" "$total_count" "$(( count > 0 ? offset + 1 : 0 ))" "$(( count > 0 ? (offset + visible < count ? offset + visible : count) : 0 ))" "$CLR_RESET"
+      tput el 2>/dev/null || true
+      if (( search_mode )); then
+        filter_view="$(truncate_text "Filter: /${query}_" "$cols")"
+      elif [[ -n "$query" ]]; then
+        filter_view="$(truncate_text "Filter: /$query" "$cols")"
+      else
+        filter_view="$(truncate_text "Filter: / (type to search, Esc clears)" "$cols")"
+      fi
+      printf '%s%s%s\n' "$CLR_DIM" "$filter_view" "$CLR_RESET"
 
       for ((line = 0; line < visible; line++)); do
         i=$((offset + line))
@@ -271,21 +331,26 @@ select_menu() {
         if (( i >= count )); then
           continue
         fi
-        text="${items[$i]}"
+        text="${items[${filtered_indices[$i]}]}"
         if (( i == idx )); then
           printf '%b> %s%b\n' "$CLR_CURSOR" "$text" "$CLR_RESET"
         else
           printf '  %s\n' "$text"
         fi
       done
+      if (( count == 0 )); then
+        tput cup "$menu_top" 0 2>/dev/null || true
+        tput el 2>/dev/null || true
+        printf '%sNo matches%s\n' "$CLR_DIM" "$CLR_RESET"
+      fi
       prev_offset=$offset
       prev_idx=$idx
-    elif (( idx != prev_idx )); then
+    elif (( idx != prev_idx )) && (( count > 0 )); then
       old_line=$((prev_idx - offset))
       if (( old_line >= 0 && old_line < visible )); then
         tput cup $((menu_top + old_line)) 0 2>/dev/null || true
         tput el 2>/dev/null || true
-        text="${items[$prev_idx]}"
+        text="${items[${filtered_indices[$prev_idx]}]}"
         printf '  %s\n' "$text"
       fi
 
@@ -293,28 +358,81 @@ select_menu() {
       if (( new_line >= 0 && new_line < visible )); then
         tput cup $((menu_top + new_line)) 0 2>/dev/null || true
         tput el 2>/dev/null || true
-        text="${items[$idx]}"
+        text="${items[${filtered_indices[$idx]}]}"
         printf '%b> %s%b\n' "$CLR_CURSOR" "$text" "$CLR_RESET"
       fi
       prev_idx=$idx
     fi
 
     IFS= read -rsn1 key || { menu_cleanup; tty_sanitize; return 1; }
+    if (( search_mode )); then
+      case "$key" in
+        "")
+          if (( count > 0 )); then
+            REPLY="${filtered_indices[$idx]}"
+            menu_cleanup
+            return 0
+          fi
+          ;;
+        $'\x7f'|$'\b')
+          if [[ -n "$query" ]]; then
+            query="${query%?}"
+            filter_dirty=1
+          fi
+          ;;
+        $'\x15')
+          query=""
+          filter_dirty=1
+          ;;
+        $'\x1b')
+          IFS= read -rsn2 -t 0.05 rest || rest=""
+          if [[ -z "$rest" ]]; then
+            search_mode=0
+            query=""
+            filter_dirty=1
+          else
+            case "$rest" in
+              "[A") if (( count > 0 )); then ((idx = (idx - 1 + count) % count)); fi ;;
+              "[B") if (( count > 0 )); then ((idx = (idx + 1) % count)); fi ;;
+            esac
+          fi
+          ;;
+        *)
+          printable=0
+          if [[ "$key" =~ [[:print:]] ]]; then
+            printable=1
+          fi
+          if (( printable )); then
+            query+="$key"
+            filter_dirty=1
+          fi
+          ;;
+      esac
+      continue
+    fi
+
     case "$key" in
       "")
-        REPLY="$idx"
-        menu_cleanup
-        return 0
+        if (( count > 0 )); then
+          REPLY="${filtered_indices[$idx]}"
+          menu_cleanup
+          return 0
+        fi
+        ;;
+      /)
+        search_mode=1
+        query=""
+        filter_dirty=1
         ;;
       $'\x1b')
         IFS= read -rsn2 -t 0.05 rest || true
         case "$rest" in
-          "[A") ((idx = (idx - 1 + count) % count)) ;;
-          "[B") ((idx = (idx + 1) % count)) ;;
+          "[A") if (( count > 0 )); then ((idx = (idx - 1 + count) % count)); fi ;;
+          "[B") if (( count > 0 )); then ((idx = (idx + 1) % count)); fi ;;
         esac
         ;;
-      k) ((idx = (idx - 1 + count) % count)) ;;
-      j) ((idx = (idx + 1) % count)) ;;
+      k) if (( count > 0 )); then ((idx = (idx - 1 + count) % count)); fi ;;
+      j) if (( count > 0 )); then ((idx = (idx + 1) % count)); fi ;;
       q)
         menu_cleanup
         return 1
